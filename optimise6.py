@@ -48,6 +48,8 @@ def silence():
         for fd in saved + [nul]: os.close(fd)
 SMAX = 10000
 
+LP_METHOD = os.environ.get('LP_METHOD', 'highs-ds')  # simplexe dual : le plus fiable sur ce modèle
+
 def build_and_solve(inst, datasets=None, energy=None, exclude=(), src_avail=None,
                     K=6, clones=False, clone_exclude=(), waste=None, verbose=True, SMALL=2500, KQ=10, mip_time=None, mip_gap=1e-6, mip_seed=0, FLUIDMIN=None, FDELTA=0.02, fix=None, WADD=0.0, WSMALL=1000, BUCKET=0, NB=40, return_model=False, SRCFLUID=False, BCOUNT=0, SRCW=None, WSRC=0.0, WSRCBIG=0.0, SRCBK=0, NMAX=4, PAIRS=0, PAIRMIN=1000, PAIRMAXW=200, NOFLUIDSRC=False, QPAIRS=0, QPAIRMIN=50, BIGL=0, NBF=12, BIGMIN=10000):
     M = inst['models']
@@ -379,8 +381,10 @@ def build_and_solve(inst, datasets=None, energy=None, exclude=(), src_avail=None
         res = R(); res.x = r.x if r.x is not None else np.zeros(len(cols)); res.status = r.status
         res.fun = r.fun if r.x is not None else 0; res.prices = None
         return res, cols
+    if verbose:
+        print(f'  LP construit : {len(cols)} variables, {nrow} lignes ({time.time()-t0:.0f}s depuis la fin de la construction) -> résolution ({LP_METHOD})...', flush=True)
     res = linprog(np.array(obj), A_ub=A, b_ub=np.array(b), A_eq=Aeq, b_eq=beq,
-                  bounds=np.column_stack([np.zeros(len(ubv)), np.array(ubv)]) if any(u != 1 for u in ubv) else (0, 1), method='highs')
+                  bounds=np.column_stack([np.zeros(len(ubv)), np.array(ubv)]) if any(u != 1 for u in ubv) else (0, 1), method=LP_METHOD)
     if verbose:
         print(f'LP st={res.status} val={-res.fun:.1f} vars={len(cols)} rows={nrow} {time.time()-t0:.1f}s', flush=True)
     du = res.ineqlin.marginals
@@ -1470,17 +1474,46 @@ def main_six():
             import gurobipy as gp; gp.Model().dispose(); solv = 'gurobi'
         except Exception:
             solv = 'highs'
-    print(f'solveur MIP : {solv}', flush=True)
-    # 1) LP complet -> colonnes utiles
-    res, cols = build_and_solve(inst, **KW)
-    x = res.x; rc = np.abs(res.lower.marginals) + np.abs(res.upper.marginals); prices = res.prices
+    import scipy, platform
+    print(f'solveur MIP : {solv} | Python {platform.python_version()} | scipy {scipy.__version__}', flush=True)
+    # 1) LP complet -> colonnes utiles (calculé une seule fois, puis relu depuis le cache)
+    import pickle
+    cache = f'cache_lp_{name}.pkl'; lock = cache + '.verrou'
+    data_ = None
+    while data_ is None:
+        if os.path.exists(cache + '.gz') and not os.path.exists(cache):
+            import gzip
+            with gzip.open(cache + '.gz', 'rb') as fh: data_ = pickle.load(fh)
+            print(f'LP relu depuis le cache fourni {cache}.gz ({time.time()-t0:.0f}s)', flush=True); break
+        if os.path.exists(cache):
+            with open(cache, 'rb') as fh: data_ = pickle.load(fh)
+            print(f'LP relu depuis le cache {cache} ({time.time()-t0:.0f}s)', flush=True); break
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd)
+        except FileExistsError:
+            if time.time() - os.path.getmtime(lock) > 4 * 3600: os.remove(lock); continue
+            print(f'  un autre calcul prépare le LP, attente... ({time.time()-t0:.0f}s)', flush=True); time.sleep(30); continue
+        try:
+            print(f'construction et résolution du LP (une seule fois pour tous les calculs)...', flush=True)
+            res, cols = build_and_solve(inst, **KW)
+            data_ = dict(cols=cols, x=np.array(res.x), rc=np.abs(res.lower.marginals) + np.abs(res.upper.marginals),
+                         prices=res.prices, fun=float(res.fun))
+            del res
+            with open(cache + '.tmp', 'wb') as fh: pickle.dump(data_, fh, protocol=4)
+            os.replace(cache + '.tmp', cache)
+        finally:
+            try: os.remove(lock)
+            except OSError: pass
+    class _Res: pass
+    res = _Res(); res.fun = data_['fun']; cols = data_['cols']
+    x = data_['x']; rc = data_['rc']; prices = data_['prices']
     keep_model = {key[1] for j, key in enumerate(cols) if x[j] > 1e-6 or rc[j] <= a.rc}
     fix = {}
     for j, key in enumerate(cols):
         if key[1] not in keep_model: fix[key] = 0.0
         elif key[0] not in ('x', 'z', 'y') and not (x[j] > 1e-6 or rc[j] <= a.rc): fix[key] = 0.0
     print(f'borne LP {-res.fun:.0f}, colonnes libres {len(cols) - len(fix)} ({time.time()-t0:.0f}s)', flush=True)
-    del res, x, rc; gc.collect()
+    del res, x, rc, data_; gc.collect()
     # 2) MIP
     c, A, b, Aeq, beq, cols, ubv = build_and_solve(inst, return_model=True, verbose=False, **KW)
     ubv = ubv.astype(float).copy()
