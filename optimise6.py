@@ -1359,7 +1359,7 @@ def lanceur(a):
         print(f'Instance introuvable : {a.instance} (lancer le script dans le dossier des instances)'); sys.exit(1)
     name = nom(a.instance); txt = open(a.instance).read()
     os.makedirs('logs', exist_ok=True); os.makedirs('out', exist_ok=True)
-    env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1')
+    env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1', PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
     print(f'{name} : {a.procs} processus en parallèle, MIP {a.mip:.0f}s, ' + (f'LNS {a.lns:.0f}s, ' if a.lns else f'recherche locale {a.rl:.0f}s, ') +
           f'{"runs illimités (Ctrl+C pour arrêter)" if not a.runs else f"{a.runs} runs"}', flush=True)
     seed = a.premiere_graine; lances = 0; running = []; t0 = time.time(); last = 0; last_launch = -1e9
@@ -1597,7 +1597,7 @@ def etat_calcul(path):
             phase = 'LNS'; m = re.search(r'meilleur (\d+)', ls) or re.search(r'value (\d+)', ls)
         elif 'NOUVEAU MEILLEUR' in ls: m = re.search(r'MEILLEUR (\d+)', ls)
         elif 'SAUVEGARDE' in ls: m = re.search(r'SAUVEGARDE (\d+)', ls)
-        elif ls.startswith('départ'): m = re.search(r'départ (\d+)', ls)
+        elif re.match(r'd\W{0,2}part ', ls): m = re.search(r'part (\d+)', ls)
         elif ls.startswith('RÉSULTAT') or ls.startswith('FINAL'):
             phase = 'terminé'; m = re.search(r'\((\d+), True', ls)
         elif 'ÉCHEC' in ls or 'Error' in ls or 'Traceback' in ls: phase = 'ERREUR'
@@ -1641,20 +1641,27 @@ def orchestrer():
         v = score_fichier(a.depart, txt)
         if v > best: shutil.copy(a.depart, BEST); best = v
     print(f'meilleure solution de départ : {best}  ({BEST})', flush=True)
+    print(f'Python utilisé : {sys.executable}', flush=True)
     try:
         import highspy  # noqa
         lns_ok = True
-    except ImportError:
-        lns_ok = False; print('(pip install highspy conseillé : active la recherche par colonnes et la boucle LNS)', flush=True)
+        print(f'highspy trouvé : {getattr(highspy, "__file__", "?")} -> recherche par colonnes et boucle LNS activées', flush=True)
+    except Exception as e:
+        lns_ok = False
+        print(f'highspy NON disponible pour ce Python ({type(e).__name__}: {e})', flush=True)
+        print('  -> installe-le dans CE Python :  "' + sys.executable + '" -m pip install highspy', flush=True)
     # gabarits : type, RAM (Go), paramètres
     gab = [dict(kind='six', ram=6.0, rc=0.3), dict(kind='six', ram=6.0, rc=0.6), dict(kind='six', ram=6.5, rc=1.2)]
     if lns_ok:
         gab += [dict(kind='cg', ram=3.5, kfrac=0.02, tabu=0), dict(kind='cg', ram=3.5, kfrac=0.03, tabu=80),
                 dict(kind='cg', ram=3.5, kfrac=0.05, tabu=120), dict(kind='std', ram=4.0)]
     gab = [dict(g) for g in gab for _ in range(max(1, a.copies))]   # chaque réglage lancé en plusieurs exemplaires
+    prio = {'cg': 0, 'std': 1, 'six': 2}   # priorité de lancement : colonnes d'abord (les plus prometteuses)
+    gab.sort(key=lambda g: prio[g['kind']])
+    print('calculs : ' + ', '.join(f"{k} x{sum(1 for g in gab if g['kind'] == k)}" for k in ('cg', 'std', 'six') if any(g['kind'] == k for g in gab)), flush=True)
     print(f'{len(gab)} calculs simultanés prévus (RAM estimée {sum(g["ram"] for g in gab):.0f} Go, plafond {a.ram:.0f} Go)', flush=True)
     running = []; seed = {i: 1 + 100 * i for i in range(len(gab))}; t0 = time.time(); last = 0; infos = {}; histo = []
-    env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1')
+    env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1', PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
     me = os.path.abspath(__file__)
     def ram_used(): return sum(gab[g]['ram'] for g, _, _ in running)
     def publier():
