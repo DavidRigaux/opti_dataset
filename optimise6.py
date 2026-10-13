@@ -1540,6 +1540,56 @@ def score_fichier(p, txt):
     except Exception:
         return 0
 
+
+def etat_calcul(path):
+    """(phase, meilleure valeur vue, dernière ligne utile) d'après le journal d'un calcul"""
+    try:
+        with open(path, 'rb') as fh:
+            fh.seek(0, 2); n = fh.tell(); fh.seek(max(0, n - 60000))
+            lines = fh.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return 'démarrage', 0, ''
+    phase = 'préparation (LP)'; best = 0; der = ''
+    for l in lines:
+        ls = l.strip()
+        if not ls: continue
+        der = ls
+        m = None
+        if ls.startswith('borne LP'): phase = 'MIP (paires exactes)'
+        elif ls.startswith('MIP en cours'): phase = 'MIP'
+        elif ls.startswith('MIP :') or ls.startswith('MIP st'): phase = 'affectation'
+        elif ls.startswith('after greedy'): phase = 'recherche locale'; m = re.search(r'after greedy (\d+)', ls)
+        elif ls.startswith('tirage'): phase = 'colonnes'
+        elif ls.startswith('LNS') or ls.startswith('  LNS') or ls.startswith('it '):
+            phase = 'LNS'; m = re.search(r'meilleur (\d+)', ls) or re.search(r'value (\d+)', ls)
+        elif 'NOUVEAU MEILLEUR' in ls: m = re.search(r'MEILLEUR (\d+)', ls)
+        elif 'SAUVEGARDE' in ls: m = re.search(r'SAUVEGARDE (\d+)', ls)
+        elif ls.startswith('départ'): m = re.search(r'départ (\d+)', ls)
+        elif ls.startswith('RÉSULTAT') or ls.startswith('FINAL'):
+            phase = 'terminé'; m = re.search(r'\((\d+), True', ls)
+        elif 'ÉCHEC' in ls or 'Error' in ls or 'Traceback' in ls: phase = 'ERREUR'
+        else:
+            mm = re.search(r'(-?\d+\.\d+)\s+(-?\d+\.\d+|inf)\s+(\d+\.\d+%|inf|Large)', ls)
+            if mm and phase.startswith('MIP'):
+                try:
+                    bb = -float(mm.group(1)); bs = mm.group(2)
+                    der = f'plan entier: {(-float(bs)):.0f}' if bs != 'inf' else 'pas encore de plan entier'
+                    der += f' | borne {bb:.0f} | écart {mm.group(3)}'
+                    continue
+                except ValueError:
+                    pass
+        if m:
+            try: best = max(best, int(float(m.group(1))))
+            except ValueError: pass
+    return phase, best, der[:90]
+
+def ram_systeme():
+    try:
+        import psutil
+        vm = psutil.virtual_memory(); return f'RAM utilisée {vm.used / 2**30:.0f}/{vm.total / 2**30:.0f} Go, CPU {psutil.cpu_percent():.0f} %'
+    except Exception:
+        return '(pip install psutil pour voir la RAM et le CPU réels)'
+
 def orchestrer():
     ap = argparse.ArgumentParser(description='Optimise l\'instance 6 en parallèle (solutions légales), garde uniquement la meilleure')
     ap.add_argument('--heures', type=float, default=10.0)
@@ -1547,6 +1597,7 @@ def orchestrer():
     ap.add_argument('--cpu', type=int, default=24)
     ap.add_argument('--instance', default='6_shortage.json')
     ap.add_argument('--depart', default='', help='ta meilleure solution actuelle (fichier .json)')
+    ap.add_argument('--copies', type=int, default=1, help='exemplaires de chaque réglage en parallèle (graines différentes)')
     a = ap.parse_args()
     if not os.path.exists(a.instance): print('Instance introuvable :', a.instance); return
     name = os.path.basename(a.instance).replace('.json', ''); BEST = f'{name}_MEILLEUR.json'
@@ -1567,7 +1618,9 @@ def orchestrer():
     if lns_ok:
         gab += [dict(kind='cg', ram=3.5, kfrac=0.02, tabu=0), dict(kind='cg', ram=3.5, kfrac=0.03, tabu=80),
                 dict(kind='cg', ram=3.5, kfrac=0.05, tabu=120), dict(kind='std', ram=4.0)]
-    running = []; seed = {i: 1 for i in range(len(gab))}; t0 = time.time(); last = 0
+    gab = [dict(g) for g in gab for _ in range(max(1, a.copies))]   # chaque réglage lancé en plusieurs exemplaires
+    print(f'{len(gab)} calculs simultanés prévus (RAM estimée {sum(g["ram"] for g in gab):.0f} Go, plafond {a.ram:.0f} Go)', flush=True)
+    running = []; seed = {i: 1 + 100 * i for i in range(len(gab))}; t0 = time.time(); last = 0; infos = {}; histo = []
     env = dict(os.environ, OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='1')
     me = os.path.abspath(__file__)
     def ram_used(): return sum(gab[g]['ram'] for g, _, _ in running)
@@ -1590,7 +1643,7 @@ def orchestrer():
                     if g['kind'] == 'cg' and not os.path.exists(BEST): continue
                     s_ = seed[gi]; seed[gi] += 1
                     if g['kind'] == 'six':
-                        cmd = [sys.executable, '-u', me, '--six', '--instance', a.instance, '--rc', str(g['rc'] * (1 + 0.15 * (s_ - 1))),
+                        cmd = [sys.executable, '-u', me, '--six', '--instance', a.instance, '--rc', str(g['rc'] * (1 + 0.15 * ((s_ - 1) % 100))),
                                '--temps', str(min(3 * 3600, reste * 0.6)), '--threads', '8']
                     elif g['kind'] == 'cg':
                         cmd = [sys.executable, '-u', me, '--cg', '--instance', a.instance, '--depart', BEST,
@@ -1601,13 +1654,26 @@ def orchestrer():
                                '--seed', str(s_), '--lns', str(lns), '--lns-mip', '120', '--lns-core', '0']
                     log = open(os.path.join('logs', f'{g["kind"]}{gi}.txt'), 'w')   # un seul journal par type de calcul
                     pr = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
-                    running.append((gi, pr, log))
+                    running.append((gi, pr, log)); infos[gi] = (s_, time.time())
                     print(f'[{(time.time()-t0)/3600:5.2f} h] lancé {g["kind"]}{gi} graine {s_} (RAM prévue {ram_used():.0f} Go)', flush=True)
             for r in running[:]:
                 if r[1].poll() is not None: r[2].close(); running.remove(r)
             if time.time() - last > 60:
-                last = time.time(); publier()
-                print(f'[{(time.time()-t0)/3600:5.2f} h] meilleur : {best}  (écart à 669 800 : {best - 669800:+d}) | calculs en cours : {len(running)}', flush=True)
+                last = time.time(); avant = best; publier()
+                if best > avant: histo.append((time.time() - t0, best))
+                reste_h = max(0.0, (fin - time.time()) / 3600)
+                print('', flush=True)
+                print(f'=== {(time.time()-t0)/3600:5.2f} h écoulées, {reste_h:5.2f} h restantes | MEILLEUR {best} (écart à 669 800 : {best - 669800:+d}) | '
+                      f'{len(running)} calculs | {ram_systeme()}', flush=True)
+                for gi, pr, _ in sorted(running, key=lambda r: r[0]):
+                    g = gab[gi]; s_, tl = infos.get(gi, (0, time.time()))
+                    ph, bv, der = etat_calcul(os.path.join('logs', f'{g["kind"]}{gi}.txt'))
+                    lib = {'six': 'paires exactes', 'cg': 'colonnes', 'std': 'MIP+LNS'}[g['kind']]
+                    el = time.time() - tl
+                    print(f'   {g["kind"]}{gi:<3} {lib:<15} graine {s_:<5} depuis {int(el // 3600)}h{int(el % 3600 // 60):02d}  '
+                          f'phase: {ph:<22} meilleur vu: {bv if bv else "-":<8} | {der}', flush=True)
+                if histo:
+                    print('   progrès : ' + ', '.join(f'{v} à {t/3600:.2f} h' for t, v in histo[-6:]), flush=True)
             time.sleep(5)
     except KeyboardInterrupt:
         print('Arrêt demandé...', flush=True)
@@ -1620,4 +1686,3 @@ if __name__ == '__main__':
     elif '--cg' in sys.argv: main_cg()
     elif '--worker' in sys.argv or '--exporter-mps' in sys.argv or '--importer' in sys.argv: main()
     else: orchestrer()
-
